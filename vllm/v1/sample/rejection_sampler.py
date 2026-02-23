@@ -148,6 +148,53 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
         )
 
+        # K-online: compute token_nll and acc_true_draft_len
+        spec_token_nll = None
+        spec_acc_true_draft_len = None
+        if getattr(sampling_metadata, "enable_k_online", False):
+            # 1. Compute NLL for all draft tokens: -log P_target(draft_token)
+            # target_logits: [num_tokens, vocab_size]
+            # metadata.draft_token_ids: [num_tokens]
+            target_logprobs = torch.log_softmax(target_logits, dim=-1)
+            token_logp = target_logprobs.gather(
+                dim=-1, index=metadata.draft_token_ids.unsqueeze(-1)).squeeze(-1)
+            token_nll = -token_logp  # [num_tokens]
+
+            # 2. Reshape into per-request [batch_size, max_spec_len]
+            batch_size = len(metadata.num_draft_tokens)
+            max_spec_len = metadata.max_spec_len
+            spec_token_nll = torch.zeros((batch_size, max_spec_len),
+                                         device=token_nll.device,
+                                         dtype=token_nll.dtype)
+
+            # 3. Calculate actual acceptance length for each request
+            spec_acc_true_draft_len = torch.zeros((batch_size, ),
+                                                  device=token_nll.device,
+                                                  dtype=torch.long)
+
+            start_idx = 0
+            for i, n in enumerate(metadata.num_draft_tokens):
+                if n > 0:
+                    end_idx = start_idx + n
+                    # Fill NLL
+                    spec_token_nll[i, :n] = token_nll[start_idx:end_idx]
+
+                    # Compute acceptance length from output_token_ids
+                    # output_token_ids[i] is [max_spec_len + 1]
+                    # The first N positions are either draft_token or recovered_token
+                    # If all N are draft_token, bonus token is at index N.
+                    # We want to know how many of the first N were draft_token (accepted).
+                    req_output = output_token_ids[i, :n]
+                    req_draft = metadata.draft_token_ids[start_idx:end_idx]
+                    
+                    # Number of leading matches
+                    matches = (req_output == req_draft.to(req_output.dtype))
+                    # cumulative product to find the first mismatch
+                    acc_len = matches.to(torch.long).cumprod(dim=0).sum()
+                    spec_acc_true_draft_len[i] = acc_len
+
+                    start_idx = end_idx
+
         logprobs_tensors = None
         if sampling_metadata.max_num_logprobs is not None:
             logprobs_tensors = self._get_logprobs_tensors(
@@ -162,6 +209,8 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            spec_token_nll=spec_token_nll,
+            spec_acc_true_draft_len=spec_acc_true_draft_len,
         )
 
     def _get_logprobs_tensors(

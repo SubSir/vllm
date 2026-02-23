@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -417,6 +418,27 @@ class GPUModelRunner(
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
+
+        # K-online (spec decode) states: req_id -> state dict
+        # Note: we read env vars here (instead of proposer) because per-request
+        # state lives in the runner.
+        self.enable_k_online = os.getenv("VLLM_DFLASH_K_ONLINE", "0") == "1"
+        self.k_online_offset = int(os.getenv("VLLM_DFLASH_K_ONLINE_OFFSET", "2"))
+        self.k_online_warmup = int(os.getenv("VLLM_DFLASH_K_ONLINE_WARMUP", "0"))
+
+        # State schema:
+        # - sum_by_acc: (num_pos + 1, num_pos) float32
+        # - count_by_acc: (num_pos + 1,) int64
+        # - steps: int
+        # - last_token_nll: (num_pos,) float32 (from previous step)
+        self._k_online_states: dict[str, dict[str, object]] = {}
+
+        # One-step cache populated by RejectionSampler output.
+        self._k_online_last_token_nll: torch.Tensor | None = None
+        self._k_online_last_acc_true: torch.Tensor | None = None
+
+        # Statistics: Total number of draft tokens sent to target for verification.
+        self.total_verify_tokens: int = 0
 
         self.eplb_state: EplbState | None = None
         """
@@ -892,6 +914,9 @@ class GPUModelRunner(
         for req_id in scheduler_output.finished_req_ids:
             self.requests.pop(req_id, None)
             self.num_prompt_logprobs.pop(req_id, None)
+            # K-online: cleanup per-request state to avoid leaks.
+            if self.enable_k_online:
+                self._k_online_states.pop(req_id, None)
         # Remove the finished requests from the persistent batch.
         # NOTE(woosuk): There could be an edge case where finished_req_ids and
         # scheduled_req_ids overlap. This happens when a request is aborted and
@@ -2152,6 +2177,11 @@ class GPUModelRunner(
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
+        # Statistics: count how many draft tokens are verified by the target.
+        # Each verified draft token contributes 1 target forward token.
+        # (The additional +1 bonus token is always verified, but this counter
+        # tracks draft verification only, aligned with k_online.py.)
+        self.total_verify_tokens += int(num_draft_tokens.sum())
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -2162,6 +2192,48 @@ class GPUModelRunner(
         # target_logits_indices:    [  0,   1,   2,   5,   6,   9]
         # bonus_logits_indices:     [  3,   4,   7,   8,  10]
 
+        # K-online adaptive K prediction
+        if self.enable_k_online:
+            num_pos = self.speculative_config.num_speculative_tokens
+            for i, req_id in enumerate(self.input_batch.req_ids):
+                if num_draft_tokens[i] <= 0:
+                    continue
+
+                state = self._k_online_states.get(req_id)
+                if state is None or state["steps"] < self.k_online_warmup:
+                    continue
+
+                # last_token_nll: (num_pos,) for the proposed draft tokens from previous step
+                token_nll = state.get("last_token_nll")
+                if token_nll is None:
+                    continue
+
+                sum_by_acc = state["sum_by_acc"]
+                count_by_acc = state["count_by_acc"]
+
+                # Build thresholds (aligned with k_online.py)
+                thresholds = torch.full((num_pos, ),
+                                        float("inf"),
+                                        device=self.device,
+                                        dtype=torch.float32)
+                acc_idx = torch.arange(num_pos, device=self.device, dtype=torch.long)
+                c = count_by_acc.index_select(0, acc_idx).to(torch.float32)
+                has = c > 0
+                if has.any():
+                    mean_vec = sum_by_acc.index_select(0, acc_idx).to(torch.float32) / c.clamp_min(
+                        1.0).unsqueeze(1)
+                    thresholds = torch.where(has, mean_vec[acc_idx, acc_idx], thresholds)
+
+                # Predict accepted draft length (acc_pred in [0..num_pos])
+                gt = token_nll > thresholds
+                if gt.any():
+                    acc_pred = int(gt.float().argmax().item())
+                else:
+                    acc_pred = int(token_nll.numel())
+
+                k = min(int(acc_pred) + int(self.k_online_offset), int(num_pos))
+                # num_draft_tokens controls how many draft tokens are verified
+                num_draft_tokens[i] = min(int(num_draft_tokens[i]), int(k))
         # Compute the logits indices.
         # [4, 1, 3, 1, 2]
         num_sampled_tokens = num_draft_tokens + 1
@@ -2859,6 +2931,9 @@ class GPUModelRunner(
     ) -> SamplerOutput:
         # Sample the next token and get logprobs if needed.
         sampling_metadata = self.input_batch.sampling_metadata
+        # K-online flag plumbed into RejectionSampler (minimal intrusion).
+        if self.enable_k_online:
+            setattr(sampling_metadata, "enable_k_online", True)
         # Update output token ids with tokens sampled in last step
         # if async scheduling and required by current sampling params.
         self.input_batch.update_async_output_token_ids()
@@ -2880,6 +2955,12 @@ class GPUModelRunner(
             logits,
             sampling_metadata,
         )
+
+        # K-online: Capture NLL and acceptance for later update
+        if self.enable_k_online:
+            self._k_online_last_token_nll = sampler_output.spec_token_nll
+            self._k_online_last_acc_true = sampler_output.spec_acc_true_draft_len
+
         return sampler_output
 
     def _bookkeeping_sync(
@@ -2990,6 +3071,39 @@ class GPUModelRunner(
             self.input_batch.num_tokens_no_spec[req_idx] = end_idx
 
             req_id = req_ids[req_idx]
+            # K-online: Update states with captured NLL and acceptance
+            if self.enable_k_online and self._k_online_last_token_nll is not None:
+                num_spec_tokens = self.speculative_config.num_speculative_tokens
+                state = self._k_online_states.get(req_id)
+                if state is None:
+                    state = {
+                        "sum_by_acc":
+                        torch.zeros((num_spec_tokens + 1, num_spec_tokens),
+                                    device=self.device,
+                                    dtype=torch.float32),
+                        "count_by_acc":
+                        torch.zeros((num_spec_tokens + 1, ),
+                                    device=self.device,
+                                    dtype=torch.long),
+                        "steps":
+                        0,
+                        "last_token_nll":
+                        None,
+                    }
+                    self._k_online_states[req_id] = state
+
+                # Update online stats using previous step's NLL and current step's acceptance
+                # Note: self._k_online_last_token_nll/acc_true are [batch_size, ...]
+                req_nll = self._k_online_last_token_nll[req_idx]
+                req_acc_true = self._k_online_last_acc_true[req_idx].item()
+
+                acc_true_idx = min(int(req_acc_true), num_spec_tokens)
+                state["sum_by_acc"][acc_true_idx] += req_nll
+                state["count_by_acc"][acc_true_idx] += 1
+                state["steps"] += 1
+                # Save current NLL for next step's prediction
+                state["last_token_nll"] = req_nll
+
             req_state = self.requests[req_id]
             req_state.output_token_ids.extend(sampled_ids)
 

@@ -119,6 +119,14 @@ class SamplerOutput:
     sampled_token_ids: torch.Tensor
     logprobs_tensors: LogprobsTensors | None
 
+    # --- Spec decode extras (optional) ---
+    # Per-request token NLL for the proposed draft tokens.
+    # Shape: [num_reqs, max_spec_len]. Entries beyond num_draft_tokens are 0.
+    spec_token_nll: torch.Tensor | None = None
+    # Per-request number of accepted draft tokens in this step.
+    # Shape: [num_reqs].
+    spec_acc_true_draft_len: torch.Tensor | None = None
+
 
 @dataclass
 class KVConnectorOutput:
