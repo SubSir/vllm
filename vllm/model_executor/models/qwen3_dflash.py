@@ -863,6 +863,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             self.model.has_separate_mask_embedding = True
 
         skip_substrs = []
+        if os.environ.get("VLLM_DFLASH2_DISABLE_CONV") == "1":
+            # The kill switch stops building the modules but leaves their weights
+            # in the checkpoint, and AutoWeightsLoader is strict about names it
+            # cannot place.
+            skip_substrs.extend(["attention_conv", "mlp_conv"])
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:
