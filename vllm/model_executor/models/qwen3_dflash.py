@@ -839,7 +839,9 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             if "d2t" in name:
                 name = name.replace("d2t", "draft_id_to_target_id")
                 includes_draft_id_mapping = True
-            elif "lm_head" not in name:
+            elif "lm_head" not in name and "candidate_selector" not in name:
+                # The selector hangs off this class, not off self.model, so it
+                # must not take the "model." prefix the backbone weights take.
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
