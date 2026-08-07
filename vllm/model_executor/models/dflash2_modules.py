@@ -58,26 +58,30 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        # No branch on the row count: the enclosing model is compiled with a
-        # symbolic batch dimension, and a Python test against it is a guard
-        # Dynamo cannot resolve. Every draft forward, dummy runs included, carries
-        # whole blocks -- num_query_per_req tokens per request -- so the reshape
-        # below is always exact.
-        blocks = hidden_states.view(
-            -1, self.block_size, self.num_groups, self.group_size
-        )
-        delta = delta.reshape(-1, self.block_size, self.taps, self.num_groups, 1)
+        # The token axis stays flat. Splitting it into (blocks, block_size) is the
+        # natural way to write this and it is what the sglang side does, but here
+        # the axis is symbolic, and asking the shape solver to relate it to
+        # block_size sends sympy into an expression tree it does not come back
+        # from -- compiling the draft hangs with no error and no progress. So the
+        # tap shift moves along the flat axis and a mask, computed from values
+        # rather than from shapes, drops the rows that would read across a block
+        # boundary. Only the last (static) dim is ever reshaped.
+        blocks = hidden_states.unflatten(-1, (self.num_groups, self.group_size))
         base = self.base_kernel[side].view(
-            1, 1, self.taps, self.num_groups, self.group_size
+            1, self.taps, self.num_groups, self.group_size
         )
-        coefficients = base + delta
-        out = coefficients[:, :, 0] * blocks
-        for tap in range(1, self.taps):
-            shifted = torch.nn.functional.pad(
-                blocks[:, :-tap], (0, 0, 0, 0, tap, 0)
+        coefficients = base + delta.unsqueeze(-1)
+        out = coefficients[:, 0] * blocks
+        if self.taps > 1:
+            position = (
+                torch.arange(hidden_states.shape[0], device=hidden_states.device)
+                % self.block_size
             )
-            out = out + coefficients[:, :, tap] * shifted
-        return out.view_as(hidden_states)
+        for tap in range(1, self.taps):
+            shifted = torch.nn.functional.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
+            keep = (position >= tap).view(-1, 1, 1).to(shifted.dtype)
+            out = out + coefficients[:, tap] * shifted * keep
+        return out.flatten(-2)
 
     def prepare(self, hidden_states: torch.Tensor):
         """Convolve a sublayer's input; return it with the kernel for its output."""
