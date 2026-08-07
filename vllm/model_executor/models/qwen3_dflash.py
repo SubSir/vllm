@@ -39,6 +39,7 @@ from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
 
+from .dflash2_modules import CandidateSelector, DFlashGroupedConv
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -320,6 +321,23 @@ class DFlashQwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
+        # DFlash2 wraps each sublayer in a grouped convolution along the block.
+        # Module names match what training exports, so no weight remapping is
+        # needed, and a DFlash checkpoint leaves both None.
+        self.attention_conv = None
+        self.mlp_conv = None
+        if dflash_config.get("conv_type") == "grouped_dynamic_depthwise":
+            conv_layers = dflash_config.get("conv_layers")
+            if conv_layers is None or layer_idx in set(conv_layers):
+                conv = lambda: DFlashGroupedConv(
+                    self.hidden_size,
+                    int(getattr(config, "block_size", 8)),
+                    int(dflash_config.get("conv_kernel_size", 2)),
+                    int(dflash_config["conv_group_size"]),
+                )
+                self.attention_conv = conv()
+                self.mlp_conv = conv()
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -332,13 +350,24 @@ class DFlashQwen3DecoderLayer(nn.Module):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
 
+        attention_kernel = None
+        if self.attention_conv is not None:
+            hidden_states, attention_kernel = self.attention_conv.prepare(hidden_states)
+
         hidden_states = self.self_attn(
             positions=positions,
             hidden_states=hidden_states,
         )
+        if attention_kernel is not None:
+            hidden_states = self.attention_conv.finish(hidden_states, attention_kernel)
 
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        mlp_kernel = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_kernel = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if mlp_kernel is not None:
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_kernel)
         return hidden_states, residual
 
 
@@ -661,6 +690,11 @@ class DFlashQwen3Model(nn.Module):
         )
 
 
+def target_vocab_size_for_selector(vllm_config: VllmConfig) -> int:
+    """Selector codebooks are indexed by global target token ids."""
+    return vllm_config.model_config.get_vocab_size()
+
+
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -686,6 +720,27 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.logits_processor = LogitsProcessor(
             self.config.draft_vocab_size, scale=logit_scale
         )
+        # DFlash2 scores the transitions between adjacent proposal slots instead
+        # of taking each slot's argmax independently. Absent from a DFlash
+        # checkpoint, whose sampling path is unchanged.
+        selector_config = (
+            getattr(self.config, "dflash_config", None) or {}
+        ).get("dflashv2_selector")
+        self.candidate_selector = None
+        if selector_config:
+            parameterization = str(selector_config.get("parameterization", ""))
+            if parameterization != "direct_ab":
+                raise ValueError(
+                    "DFlash2 selector requires dflashv2_selector.parameterization "
+                    f"'direct_ab'; got {parameterization!r}."
+                )
+            self.candidate_selector = CandidateSelector(
+                hidden_size=self.config.hidden_size,
+                vocab_size=target_vocab_size_for_selector(vllm_config),
+                state_rank=int(selector_config["rank"]),
+                top_k=int(selector_config["top_k"]),
+            )
+
         target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(

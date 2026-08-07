@@ -11,6 +11,7 @@ from vllm.config import VllmConfig, replace
 from vllm.config.compilation import CUDAGraphMode
 from vllm.forward_context import BatchDescriptor, set_forward_context
 from vllm.logger import init_logger
+from vllm.v1.worker.gpu.sample.gumbel import gumbel_sample
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
@@ -44,6 +45,18 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
+
+        # Set from the model in load_draft_model; None on a plain DFlash draft.
+        self.candidate_selector = None
+        # The bonus token sits at query slot 0 of each request's block, and it is
+        # the predecessor the first proposal slot conditions on.
+        self._anchor_index = (
+            torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
+            * self.num_query_per_req
+        )
+        # Widening buffer for the non-greedy selector walk; allocated on first use
+        # so a greedy-only deployment never pays for it.
+        self._selector_scatter_buf: torch.Tensor | None = None
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
@@ -157,7 +170,19 @@ class DFlashSpeculator(DraftModelSpeculator):
         target_model: nn.Module,
         target_attn_layer_names: set[str],
     ) -> nn.Module:
-        return load_dflash_model(target_model, self.vllm_config)
+        model = load_dflash_model(target_model, self.vllm_config)
+        self.candidate_selector = getattr(model, "candidate_selector", None)
+        if self.candidate_selector is not None and self.draft_logits is not None:
+            self._selector_scatter_buf = torch.full(
+                (self.max_num_reqs, self.vocab_size),
+                float("-inf"),
+                dtype=self.draft_logits.dtype,
+                device=self.device,
+            )
+        if self.candidate_selector is not None:
+            logger.info("DFlash2 candidate selector active (top-%d).",
+                        self.candidate_selector.top_k)
+        return model
 
     def set_attn(
         self,
@@ -259,6 +284,11 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         num_sample = num_reqs * self.num_speculative_steps
         sample_hidden_states = last_hidden_states[self.sample_indices[:num_sample]]
+        if self.candidate_selector is not None:
+            self.draft_tokens[:num_reqs] = self._select_draft(
+                num_reqs, sample_hidden_states
+            )
+            return
         # sample_pos is the predicted token's position Q; verification keys
         # Gumbel by the predecessor (Q-1). sample_draft adds +1, so pass Q-2.
         draft_tokens = self.sample_draft(
@@ -273,6 +303,86 @@ class DFlashSpeculator(DraftModelSpeculator):
         self.draft_tokens[:num_reqs] = draft_tokens.view(
             num_reqs, self.num_speculative_steps
         )
+
+    def _select_draft(
+        self, num_reqs: int, sample_hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        """DFlash2: score the transitions between adjacent slots, then walk them.
+
+        A plain DFlash draft takes each slot's argmax independently, so a slot can
+        propose a token the slot before it makes impossible. The selector keeps the
+        top-16 per slot and picks the path, which is what the extra acceptance is.
+        """
+        selector = self.candidate_selector
+        steps = self.num_speculative_steps
+        logits = self.model.compute_logits(sample_hidden_states)
+        unary, ids = torch.topk(logits, selector.top_k, dim=-1)
+        candidate_ids = ids.view(num_reqs, steps, selector.top_k)
+        anchors = self.input_buffers.input_ids[
+            self._anchor_index[:num_reqs]
+        ]
+        scores = selector.score_edges(
+            candidate_ids=candidate_ids,
+            unary_logits=unary.view(num_reqs, steps, selector.top_k).float(),
+            hidden_states=sample_hidden_states.view(num_reqs, steps, -1),
+            anchor_token_ids=anchors,
+        )
+        if self.draft_logits is None:
+            return selector.walk(candidate_ids, scores)
+        return self._walk_sampled(num_reqs, candidate_ids, scores)
+
+    def _walk_sampled(
+        self,
+        num_reqs: int,
+        candidate_ids: torch.Tensor,
+        scores: torch.Tensor,
+    ) -> torch.Tensor:
+        """Non-greedy walk, one proposal slot at a time.
+
+        Each slot's distribution is conditioned on the token drawn at the slot
+        before it, so this cannot be done in one shot. The K scores of the chosen
+        row are scattered into a target-vocabulary buffer -- everything else
+        ``-inf`` -- and handed to the same Gumbel sampler the other drafts use, so
+        ``draft_logits`` records exactly the distribution the draft sampled from
+        and the target's rejection stays lossless. This mirrors how DSpark widens
+        its reduced draft vocabulary before sampling.
+        """
+        selector = self.candidate_selector
+        steps = self.num_speculative_steps
+        buf = self._selector_scatter_buf[:num_reqs]
+        pos = self.sample_pos[: num_reqs * steps].view(num_reqs, steps)
+        idx_map = self.sample_idx_mapping[: num_reqs * steps].view(num_reqs, steps)
+        col = self.sample_col[: num_reqs * steps].view(num_reqs, steps)
+
+        slot = None
+        tokens = []
+        for step in range(steps):
+            if step == 0:
+                row = scores[:, 0, 0]
+            else:
+                row = scores[:, step].gather(
+                    1, slot[:, None, None].expand(-1, 1, selector.top_k)
+                )[:, 0]
+            buf.fill_(float("-inf"))
+            buf.scatter_(1, candidate_ids[:, step], row.to(buf.dtype))
+            token = gumbel_sample(
+                buf,
+                idx_map[:, step],
+                self.temperature,
+                self.seeds,
+                pos[:, step] - 2 + 1,
+                apply_temperature=True,
+                logits_cache=self.draft_logits,
+                logits_cache_col=col[:, step],
+                use_fp64=self.use_fp64_gumbel,
+            )
+            # Recover which candidate slot was drawn so the next row conditions
+            # on it. Candidate ids within a slot are distinct, so this is exact.
+            slot = (candidate_ids[:, step] == token[:, None]).to(torch.int64).argmax(
+                dim=-1
+            )
+            tokens.append(token)
+        return torch.stack(tokens, dim=1)
 
     def _build_draft_attn_metadata(
         self,
