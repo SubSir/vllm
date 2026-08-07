@@ -30,6 +30,24 @@ from vllm.v1.worker.utils import AttentionGroup
 logger = init_logger(__name__)
 
 
+try:  # flashinfer's radix kernel is roughly 2x torch.topk on a 150k vocab
+    from flashinfer import top_k as _flashinfer_top_k
+except Exception:  # pragma: no cover
+    _flashinfer_top_k = None
+
+
+def _select_top_k(logits: torch.Tensor, k: int):
+    """Top-k over the vocabulary for every proposal slot.
+
+    This is the selector's largest single cost -- it reads the whole logits
+    tensor -- so the kernel matters: torch.topk here made the draft step slow
+    enough to halve end-to-end throughput against a plain DFlash draft.
+    """
+    if _flashinfer_top_k is not None:
+        return _flashinfer_top_k(logits, k, sorted=True, deterministic=True)
+    return torch.topk(logits, k, dim=-1)
+
+
 class DFlashSpeculator(DraftModelSpeculator):
     _speculator_name = "DFlash"  # For logging, so we can share methods with subclasses
 
@@ -316,7 +334,7 @@ class DFlashSpeculator(DraftModelSpeculator):
         selector = self.candidate_selector
         steps = self.num_speculative_steps
         logits = self.model.compute_logits(sample_hidden_states)
-        unary, ids = torch.topk(logits, selector.top_k, dim=-1)
+        unary, ids = _select_top_k(logits, selector.top_k)
         candidate_ids = ids.view(num_reqs, steps, selector.top_k)
         anchors = self.input_buffers.input_ids[
             self._anchor_index[:num_reqs]
