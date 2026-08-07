@@ -58,15 +58,11 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        # Real drafting always hands over whole blocks; a profiling dummy run need
-        # not, and crashing at startup on a shape whose values are discarded anyway
-        # would be the wrong trade.
-        remainder = hidden_states.shape[0] % self.block_size
-        if remainder:
-            pad = self.block_size - remainder
-            padded = torch.nn.functional.pad(hidden_states, (0, 0, 0, pad))
-            delta = torch.nn.functional.pad(delta, (0, 0, 0, 0, 0, pad))
-            return self._convolve(padded, delta, side)[: hidden_states.shape[0]]
+        # No branch on the row count: the enclosing model is compiled with a
+        # symbolic batch dimension, and a Python test against it is a guard
+        # Dynamo cannot resolve. Every draft forward, dummy runs included, carries
+        # whole blocks -- num_query_per_req tokens per request -- so the reshape
+        # below is always exact.
         blocks = hidden_states.view(
             -1, self.block_size, self.num_groups, self.group_size
         )
