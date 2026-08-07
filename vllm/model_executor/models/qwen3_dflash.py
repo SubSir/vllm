@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import io
+import os
 from collections.abc import Iterable
 
 import torch
@@ -326,7 +327,13 @@ class DFlashQwen3DecoderLayer(nn.Module):
         # needed, and a DFlash checkpoint leaves both None.
         self.attention_conv = None
         self.mlp_conv = None
-        if dflash_config.get("conv_type") == "grouped_dynamic_depthwise":
+        # VLLM_DFLASH2_DISABLE_CONV serves the selector alone. The convolution
+        # carries a tensor from prepare() across the attention call to finish(),
+        # and vLLM splits its compiled region at attention, so this is the knob
+        # that says whether that crossing is what stalls startup.
+        conv_disabled = os.environ.get("VLLM_DFLASH2_DISABLE_CONV") == "1"
+        if (not conv_disabled
+                and dflash_config.get("conv_type") == "grouped_dynamic_depthwise"):
             conv_layers = dflash_config.get("conv_layers")
             if conv_layers is None or layer_idx in set(conv_layers):
                 conv = lambda: DFlashGroupedConv(
