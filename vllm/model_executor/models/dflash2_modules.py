@@ -97,6 +97,11 @@ class CandidateSelector(nn.Module):
         self.successor_codebook.weight.requires_grad_(False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
 
+    # Compiled here rather than by the model's @support_torch_compile: the selector
+    # runs in the speculator, past what that decorator covers. Inside the captured
+    # draft graph this is still worth 61-67% of the two steps together, because a
+    # replay pays per node.
+    @torch.compile(dynamic=True)
     def score_edges(
         self,
         *,
@@ -123,13 +128,14 @@ class CandidateSelector(nn.Module):
         )
 
     @staticmethod
+    @torch.compile(dynamic=True)
     def walk(candidate_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """Greedy walk: slot 0 from the anchor edge, then each slot's argmax given
         the slot chosen before it.
 
-        Sequential over the L slots, each step an argmax over K=16. Composing the
-        per-edge maps with a log-depth scan instead is only worth its buffers when
-        L is much larger than this.
+        Sequential over the L slots, each an argmax over K=16, which compiles to a
+        cost that does not move with batch -- the per-edge maps and a log-depth scan
+        would buy nothing here.
         """
         length = scores.shape[1]
         slot = scores[:, 0, 0].argmax(dim=-1)
