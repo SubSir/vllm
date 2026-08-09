@@ -4,11 +4,8 @@
 
 A grouped dynamic convolution along the block, wrapping each sublayer, and a
 direct-A/B candidate selector that scores the transitions between adjacent
-proposal slots instead of committing to each slot's argmax independently.
-
-Both are inert on a plain DFlash checkpoint: the convolution is built only when
-``dflash_config.conv_type`` says so, and the selector only when
-``dflash_config.dflashv2_selector`` is present.
+proposal slots instead of committing to each slot's argmax independently. Both
+are inert on a plain DFlash checkpoint, which declares neither.
 """
 
 import torch
@@ -18,22 +15,8 @@ from torch import nn
 class DFlashGroupedConv(nn.Module):
     """Grouped dynamic depthwise K-tap convolution across one DFlash block.
 
-        row_i <- sum_t (base[t] + delta_i[t]) * row_{i-t}
-
-    ``base`` is a static per-channel kernel; ``delta`` is predicted for the row by
-    one projection and shared by every channel of a group, so a hidden of H with
-    group size g carries H/g coefficients per tap instead of H. One projection
-    produces the kernel for the sublayer's input and the one for its output, which
-    is why ``prepare`` hands the second half to ``finish``.
-
-    Taps read backwards within the block and are zero across its boundary, so a row
-    never sees a position the draft has not proposed yet.
-
-    Written as plain tensor ops rather than a fused kernel: the enclosing model
-    carries ``@support_torch_compile``, so inductor fuses this chain the way a
-    hand-written kernel would. Unfused, the same expression costs roughly half a
-    draft forward -- almost all of it materialising ``base + delta`` and a padded
-    copy that a fused form keeps in registers.
+    Each sublayer is wrapped: `prepare` convolves its input and returns the kernel
+    for `finish` to convolve its output, both from one projection of the input.
     """
 
     def __init__(
@@ -44,6 +27,8 @@ class DFlashGroupedConv(nn.Module):
             raise ValueError(
                 f"conv_group_size={group_size} must divide hidden_size={hidden_size}"
             )
+        if block_size & (block_size - 1):
+            raise ValueError(f"block_size={block_size} must be a power of two")
         self.hidden_size = int(hidden_size)
         self.block_size = int(block_size)
         self.taps = int(taps)
@@ -58,25 +43,20 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        # The token axis stays flat. Splitting it into (blocks, block_size) is the
-        # natural way to write this and it is what the sglang side does, but here
-        # the axis is symbolic, and asking the shape solver to relate it to
-        # block_size sends sympy into an expression tree it does not come back
-        # from -- compiling the draft hangs with no error and no progress. So the
-        # tap shift moves along the flat axis and a mask, computed from values
-        # rather than from shapes, drops the rows that would read across a block
-        # boundary. Only the last (static) dim is ever reshaped.
+        # The token axis stays flat. Splitting it into (blocks, block_size) makes
+        # the index arithmetic symbolic on the one axis @support_torch_compile
+        # marks dynamic, which nothing downstream can fold; the block boundary is
+        # a mask over positions instead.
         blocks = hidden_states.unflatten(-1, (self.num_groups, self.group_size))
         base = self.base_kernel[side].view(
             1, self.taps, self.num_groups, self.group_size
         )
         coefficients = base + delta.unsqueeze(-1)
         out = coefficients[:, 0] * blocks
-        if self.taps > 1:
-            position = (
-                torch.arange(hidden_states.shape[0], device=hidden_states.device)
-                % self.block_size
-            )
+        position = (
+            torch.arange(hidden_states.shape[0], device=hidden_states.device)
+            & (self.block_size - 1)
+        )
         for tap in range(1, self.taps):
             shifted = torch.nn.functional.pad(blocks[:-tap], (0, 0, 0, 0, tap, 0))
             keep = (position >= tap).view(-1, 1, 1).to(shifted.dtype)
@@ -84,7 +64,6 @@ class DFlashGroupedConv(nn.Module):
         return out.flatten(-2)
 
     def prepare(self, hidden_states: torch.Tensor):
-        """Convolve a sublayer's input; return it with the kernel for its output."""
         coefficients = self.kernel_projection(hidden_states).reshape(
             *hidden_states.shape[:-1], 2, self.taps, self.num_groups
         )
@@ -100,17 +79,10 @@ class DFlashGroupedConv(nn.Module):
 
 
 class CandidateSelector(nn.Module):
-    """Direct-edge candidate selector.
+    """Scores the K x K transitions between adjacent proposal slots, then walks them.
 
-    An edge between a predecessor token p at one proposal slot and a candidate c at
-    the next is scored directly in the two token directions:
-
-        edge(p -> c) = <A[p] * project(h), B[c]>
-
-    A and B are separate [vocab, r] tables, so predecessor and successor are untied.
-    Training folds the 1/sqrt(r) scale into B and ships both materialised, so this
-    side only gathers rows; they are replicated rather than vocab-sharded because
-    candidate ids are global.
+    The [vocab, r] tables are replicated on every TP rank rather than sharded like
+    the LM head: candidate ids are gathered globally, so any rank can need any row.
     """
 
     def __init__(
@@ -119,12 +91,10 @@ class CandidateSelector(nn.Module):
         super().__init__()
         self.state_rank = int(state_rank)
         self.top_k = int(top_k)
-        self.predecessor_token_table = nn.Parameter(
-            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
-        )
-        self.successor_token_table = nn.Parameter(
-            torch.empty(int(vocab_size), self.state_rank), requires_grad=False
-        )
+        self.predecessor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.successor_codebook = nn.Embedding(int(vocab_size), self.state_rank)
+        self.predecessor_codebook.weight.requires_grad_(False)
+        self.successor_codebook.weight.requires_grad_(False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
 
     def score_edges(
@@ -135,17 +105,15 @@ class CandidateSelector(nn.Module):
         hidden_states: torch.Tensor,
         anchor_token_ids: torch.Tensor,
     ) -> torch.Tensor:
-        """[B, L, K] candidates -> [B, L, previous_K, current_K] edge scores:
+        """score[b,l,p,c] = unary[b,l,c] + <A[pred[b,l,p]] * project(h[b,l]), B[c]>
 
-            score[b,l,p,c] = unary[b,l,c] + <A[pred[b,l,p]] * project(h[b,l]), B[c]>
-
-        pred is cand[b,l-1]; slot 0's predecessor is the verified anchor, broadcast
-        over p so it needs no code path of its own.
+        pred is cand[b,l-1], and the verified anchor for slot 0.
         """
-        keys = self.successor_token_table[candidate_ids]
+        predecessor = self.predecessor_codebook.weight
+        keys = self.successor_codebook.weight[candidate_ids]
         hidden = self.hidden_projection(hidden_states)
-        candidates = self.predecessor_token_table[candidate_ids]
-        anchor = self.predecessor_token_table[anchor_token_ids]
+        candidates = predecessor[candidate_ids]
+        anchor = predecessor[anchor_token_ids]
         predecessors = torch.cat(
             [anchor[:, None, None].expand(-1, 1, self.top_k, -1), candidates[:, :-1]],
             dim=1,
@@ -156,15 +124,14 @@ class CandidateSelector(nn.Module):
 
     @staticmethod
     def walk(candidate_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
-        """Greedy walk: pick slot 0 from the anchor edge, then follow each slot's
-        argmax given the slot chosen before it.
+        """Greedy walk: slot 0 from the anchor edge, then each slot's argmax given
+        the slot chosen before it.
 
-        Sequential over the L proposal slots, but each step is an argmax over K=16,
-        so the whole walk is a handful of tiny kernels. The alternative -- composing
-        the per-edge maps with a log-depth scan -- is only worth its buffers when L
-        is much larger than this.
+        Sequential over the L slots, each step an argmax over K=16. Composing the
+        per-edge maps with a log-depth scan instead is only worth its buffers when
+        L is much larger than this.
         """
-        batch, length = scores.shape[0], scores.shape[1]
+        length = scores.shape[1]
         slot = scores[:, 0, 0].argmax(dim=-1)
         slots = [slot]
         for position in range(1, length):
@@ -178,11 +145,8 @@ class CandidateSelector(nn.Module):
 
     @staticmethod
     def rows_along(scores: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-        """The K-wide score row each slot was actually chosen from, [B, L, K].
-
-        This is what a non-greedy verify needs: the distribution the draft sampled
-        from at every position, which is conditioned on the token it drew before.
-        """
+        """The K-wide score row each slot was chosen from, [B, L, K]: what a
+        non-greedy verify needs, conditioned on the token drawn before it."""
         first = scores[:, :1, 0]
         rest = scores[:, 1:].gather(
             2, slots[:, :-1, None, None].expand(-1, -1, 1, scores.shape[-1])

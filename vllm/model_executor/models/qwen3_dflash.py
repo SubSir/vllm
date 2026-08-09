@@ -265,6 +265,41 @@ class DFlashQwen3Attention(nn.Module):
         return output
 
 
+def dflash2_conv_spec(config, layer_idx: int):
+    """(taps, group_size, block_size, sublayers) for this layer, or None.
+
+    conv_kernel_size is the switch: a DFlash checkpoint declares neither size and
+    takes the path it always took. conv_layers and conv_sites say where, absent
+    means everywhere, and a site names its sublayer -- "attention_input" and
+    "attention" are the same entry, since one module convolves a sublayer on the
+    way in and on the way out.
+    """
+    dflash_config = getattr(config, "dflash_config", None) or {}
+    taps = int(dflash_config.get("conv_kernel_size", 0))
+    group_size = int(dflash_config.get("conv_group_size", 0))
+    if bool(taps) != bool(group_size):
+        raise ValueError(
+            "DFlash2 needs conv_kernel_size and conv_group_size together. "
+            f"Got conv_kernel_size={taps}, conv_group_size={group_size}."
+        )
+    if not taps:
+        return None
+    layers = dflash_config.get("conv_layers")
+    if layers is not None and layer_idx not in {int(i) for i in layers}:
+        return None
+    sites = dflash_config.get("conv_sites")
+    sublayers = (
+        {"attention", "ffn"}
+        if sites is None
+        else {str(site).split("_")[0] for site in sites}
+    )
+    if not sublayers <= {"attention", "ffn"}:
+        raise ValueError(
+            f"DFlash2 convolves attention and ffn. Got conv_sites={sorted(sites)}."
+        )
+    return taps, group_size, int(getattr(config, "block_size", 8)), sublayers
+
+
 class DFlashQwen3DecoderLayer(nn.Module):
     def __init__(
         self,
@@ -322,28 +357,21 @@ class DFlashQwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        # DFlash2 wraps each sublayer in a grouped convolution along the block.
-        # Module names match what training exports, so no weight remapping is
-        # needed, and a DFlash checkpoint leaves both None.
         self.attention_conv = None
         self.mlp_conv = None
-        # VLLM_DFLASH2_DISABLE_CONV serves the selector alone. The convolution
-        # carries a tensor from prepare() across the attention call to finish(),
-        # and vLLM splits its compiled region at attention, so this is the knob
-        # that says whether that crossing is what stalls startup.
-        conv_disabled = os.environ.get("VLLM_DFLASH2_DISABLE_CONV") == "1"
-        if (not conv_disabled
-                and dflash_config.get("conv_type") == "grouped_dynamic_depthwise"):
-            conv_layers = dflash_config.get("conv_layers")
-            if conv_layers is None or layer_idx in set(conv_layers):
-                conv = lambda: DFlashGroupedConv(
-                    self.hidden_size,
-                    int(getattr(config, "block_size", 8)),
-                    int(dflash_config.get("conv_kernel_size", 2)),
-                    int(dflash_config["conv_group_size"]),
+        spec = dflash2_conv_spec(config, layer_idx)
+        if spec is not None:
+            taps, group_size, block_size, sublayers = spec
+
+            def conv(sublayer):
+                if sublayer not in sublayers:
+                    return None
+                return DFlashGroupedConv(
+                    self.hidden_size, block_size, taps, group_size
                 )
-                self.attention_conv = conv()
-                self.mlp_conv = conv()
+
+            self.attention_conv = conv("attention")
+            self.mlp_conv = conv("ffn")
 
     def forward(
         self,
@@ -730,22 +758,21 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         # DFlash2 scores the transitions between adjacent proposal slots instead
         # of taking each slot's argmax independently. Absent from a DFlash
         # checkpoint, whose sampling path is unchanged.
-        selector_config = (
-            getattr(self.config, "dflash_config", None) or {}
-        ).get("dflashv2_selector")
+        dflash_config = getattr(self.config, "dflash_config", None) or {}
+        state_rank = int(dflash_config.get("selector_rank", 0))
+        top_k = int(dflash_config.get("selector_top_k", 0))
+        if bool(state_rank) != bool(top_k):
+            raise ValueError(
+                "DFlash2 selector needs selector_rank and selector_top_k together. "
+                f"Got selector_rank={state_rank}, selector_top_k={top_k}."
+            )
         self.candidate_selector = None
-        if selector_config:
-            parameterization = str(selector_config.get("parameterization", ""))
-            if parameterization != "direct_ab":
-                raise ValueError(
-                    "DFlash2 selector requires dflashv2_selector.parameterization "
-                    f"'direct_ab'; got {parameterization!r}."
-                )
+        if state_rank:
             self.candidate_selector = CandidateSelector(
                 hidden_size=self.config.hidden_size,
                 vocab_size=target_vocab_size_for_selector(vllm_config),
-                state_rank=int(selector_config["rank"]),
-                top_k=int(selector_config["top_k"]),
+                state_rank=state_rank,
+                top_k=top_k,
             )
 
         target_vocab_size = vllm_config.model_config.get_vocab_size()
@@ -863,11 +890,6 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             self.model.has_separate_mask_embedding = True
 
         skip_substrs = []
-        if os.environ.get("VLLM_DFLASH2_DISABLE_CONV") == "1":
-            # The kill switch stops building the modules but leaves their weights
-            # in the checkpoint, and AutoWeightsLoader is strict about names it
-            # cannot place.
-            skip_substrs.extend(["attention_conv", "mlp_conv"])
         if not includes_draft_id_mapping:
             skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:
