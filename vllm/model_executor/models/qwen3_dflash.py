@@ -39,6 +39,7 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
+
 from .qwen2 import Qwen2MLP as Qwen3MLP
 from .qwen3 import Qwen3ForCausalLM
 from .utils import (
@@ -48,7 +49,6 @@ from .utils import (
     maybe_prefix,
     process_eagle_weight,
 )
-
 
 logger = init_logger(__name__)
 
