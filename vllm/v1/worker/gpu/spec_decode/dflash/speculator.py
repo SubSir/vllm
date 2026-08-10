@@ -59,15 +59,13 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
 
-        # Set in load_draft_model; None on a plain DFlash draft.
         self.candidate_selector = None
+        self._selector_scatter_buf: torch.Tensor | None = None
         # Query slot 0 holds the bonus token, the predecessor of proposal slot 0.
         self._anchor_index = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
-        # Widening buffer for the non-greedy walk, allocated on first use.
-        self._selector_scatter_buf: torch.Tensor | None = None
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
             self.draft_model_config.hf_config
