@@ -148,13 +148,3 @@ class CandidateSelector(nn.Module):
             slots.append(slot)
         path = torch.stack(slots, dim=1)
         return candidate_ids.gather(-1, path[..., None])[..., 0]
-
-    @staticmethod
-    def rows_along(scores: torch.Tensor, slots: torch.Tensor) -> torch.Tensor:
-        """The K-wide score row each slot was chosen from, [B, L, K]: what a
-        non-greedy verify needs, conditioned on the token drawn before it."""
-        first = scores[:, :1, 0]
-        rest = scores[:, 1:].gather(
-            2, slots[:, :-1, None, None].expand(-1, -1, 1, scores.shape[-1])
-        )[:, :, 0]
-        return torch.cat((first, rest), dim=1)
