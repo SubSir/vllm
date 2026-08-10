@@ -61,7 +61,6 @@ class DFlashSpeculator(DraftModelSpeculator):
 
         self.candidate_selector = None
         self._selector_scatter_buf: torch.Tensor | None = None
-        # Query slot 0 holds the bonus token, the predecessor of proposal slot 0.
         self._anchor_index = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
