@@ -39,6 +39,15 @@ from vllm.v1.attention.backend import AttentionType
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     get_eagle3_aux_layers_from_config,
 )
+from .qwen2 import Qwen2MLP as Qwen3MLP
+from .qwen3 import Qwen3ForCausalLM
+from .utils import (
+    AutoWeightsLoader,
+    WeightsMapper,
+    get_draft_quant_config,
+    maybe_prefix,
+    process_eagle_weight,
+)
 
 
 logger = init_logger(__name__)
@@ -286,10 +295,8 @@ class DFlashGroupedConv(nn.Module):
     def _convolve(
         self, hidden_states: torch.Tensor, delta: torch.Tensor, side: int
     ) -> torch.Tensor:
-        # The token axis stays flat. Splitting it into (blocks, block_size) makes
-        # the index arithmetic symbolic on the one axis @support_torch_compile
-        # marks dynamic, which nothing downstream can fold; the block boundary is
-        # a mask over positions instead.
+        # The token axis stays flat: it is the one dim @support_torch_compile marks
+        # dynamic, so a (blocks, block_size) split never folds. Mask instead.
         blocks = hidden_states.unflatten(-1, (self.num_groups, self.group_size))
         base = self.base_kernel[side].view(
             1, self.taps, self.num_groups, self.group_size
