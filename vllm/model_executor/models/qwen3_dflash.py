@@ -394,12 +394,10 @@ class CandidateSelector(nn.Module):
         return candidate_ids.gather(-1, path[..., None])[..., 0]
 
 
-def dflash2_conv_spec(config, layer_idx: int):
-    """(taps, group_size, block_size, sublayers) for this layer, or None.
+def dflash2_conv_spec(config):
+    """(taps, group_size, block_size), or None on a DFlash checkpoint.
 
-    conv_kernel_size is the switch; conv_layers and conv_sites narrow where, absent
-    means everywhere. A site names its sublayer, not its direction: one module
-    convolves that sublayer both on the way in and on the way out.
+    conv_kernel_size is the switch and must appear with conv_group_size.
     """
     dflash_config = getattr(config, "dflash_config", None) or {}
     taps = int(dflash_config.get("conv_kernel_size", 0))
@@ -411,20 +409,7 @@ def dflash2_conv_spec(config, layer_idx: int):
         )
     if not taps:
         return None
-    layers = dflash_config.get("conv_layers")
-    if layers is not None and layer_idx not in {int(i) for i in layers}:
-        return None
-    sites = dflash_config.get("conv_sites")
-    sublayers = (
-        {"attention", "ffn"}
-        if sites is None
-        else {str(site).split("_")[0] for site in sites}
-    )
-    if not sublayers <= {"attention", "ffn"}:
-        raise ValueError(
-            f"DFlash2 convolves attention and ffn. Got conv_sites={sorted(sites)}."
-        )
-    return taps, group_size, int(getattr(config, "block_size", 8)), sublayers
+    return taps, group_size, int(getattr(config, "block_size", 8))
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
@@ -484,21 +469,16 @@ class DFlashQwen3DecoderLayer(nn.Module):
             config.hidden_size, eps=config.rms_norm_eps
         )
 
-        self.attention_conv = None
-        self.mlp_conv = None
-        spec = dflash2_conv_spec(config, layer_idx)
-        if spec is not None:
-            taps, group_size, block_size, sublayers = spec
+        spec = dflash2_conv_spec(config)
 
-            def conv(sublayer):
-                if sublayer not in sublayers:
-                    return None
-                return DFlashGroupedConv(
-                    self.hidden_size, block_size, taps, group_size
-                )
+        def conv():
+            if spec is None:
+                return None
+            taps, group_size, block_size = spec
+            return DFlashGroupedConv(self.hidden_size, block_size, taps, group_size)
 
-            self.attention_conv = conv("attention")
-            self.mlp_conv = conv("ffn")
+        self.attention_conv = conv()
+        self.mlp_conv = conv()
 
     def forward(
         self,
