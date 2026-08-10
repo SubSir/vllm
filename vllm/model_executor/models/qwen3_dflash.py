@@ -852,11 +852,6 @@ class DFlashQwen3Model(nn.Module):
         )
 
 
-def target_vocab_size_for_selector(vllm_config: VllmConfig) -> int:
-    """Selector codebooks are indexed by global target token ids."""
-    return vllm_config.model_config.get_vocab_size()
-
-
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
@@ -893,16 +888,17 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 "DFlash2 selector needs selector_rank and selector_top_k together. "
                 f"Got selector_rank={state_rank}, selector_top_k={top_k}."
             )
+        target_vocab_size = vllm_config.model_config.get_vocab_size()
         self.candidate_selector = None
         if state_rank:
+            # The codebooks are indexed by target token ids, not draft ones.
             self.candidate_selector = CandidateSelector(
                 hidden_size=self.config.hidden_size,
-                vocab_size=target_vocab_size_for_selector(vllm_config),
+                vocab_size=target_vocab_size,
                 state_rank=state_rank,
                 top_k=top_k,
             )
 
-        target_vocab_size = vllm_config.model_config.get_vocab_size()
         if self.config.draft_vocab_size != target_vocab_size:
             self.draft_id_to_target_id = nn.Parameter(
                 torch.zeros(self.config.draft_vocab_size, dtype=torch.long),
