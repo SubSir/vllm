@@ -37,12 +37,7 @@ except Exception:  # pragma: no cover
 
 
 def _select_top_k(logits: torch.Tensor, k: int):
-    """Top-k over the vocabulary for every proposal slot.
-
-    This is the selector's largest single cost -- it reads the whole logits
-    tensor -- so the kernel matters: torch.topk here made the draft step slow
-    enough to halve end-to-end throughput against a plain DFlash draft.
-    """
+    """Top-k over the vocabulary; torch.topk here halves end-to-end throughput."""
     if _flashinfer_top_k is not None:
         return _flashinfer_top_k(logits, k, sorted=True, deterministic=True)
     return torch.topk(logits, k, dim=-1)
@@ -64,16 +59,14 @@ class DFlashSpeculator(DraftModelSpeculator):
         # Each request emits exactly (bonus + N mask) query tokens per step.
         self.num_query_per_req = 1 + self.num_speculative_steps
 
-        # Set from the model in load_draft_model; None on a plain DFlash draft.
+        # Set in load_draft_model; None on a plain DFlash draft.
         self.candidate_selector = None
-        # The bonus token sits at query slot 0 of each request's block, and it is
-        # the predecessor the first proposal slot conditions on.
+        # Query slot 0 holds the bonus token, the predecessor of proposal slot 0.
         self._anchor_index = (
             torch.arange(self.max_num_reqs, dtype=torch.int64, device=device)
             * self.num_query_per_req
         )
-        # Widening buffer for the non-greedy selector walk; allocated on first use
-        # so a greedy-only deployment never pays for it.
+        # Widening buffer for the non-greedy walk, allocated on first use.
         self._selector_scatter_buf: torch.Tensor | None = None
 
         self.parallel_drafting_token_id = get_parallel_drafting_token_id(
@@ -325,11 +318,8 @@ class DFlashSpeculator(DraftModelSpeculator):
     def _select_draft(
         self, num_reqs: int, sample_hidden_states: torch.Tensor
     ) -> torch.Tensor:
-        """DFlash2: score the transitions between adjacent slots, then walk them.
-
-        A plain DFlash draft takes each slot's argmax independently, so a slot can
-        propose a token the slot before it makes impossible. The selector keeps the
-        top-16 per slot and picks the path, which is what the extra acceptance is.
+        """Score the transitions between adjacent slots and walk them, rather than
+        taking each slot's argmax alone where a slot can contradict the one before.
         """
         selector = self.candidate_selector
         steps = self.num_speculative_steps
@@ -394,8 +384,7 @@ class DFlashSpeculator(DraftModelSpeculator):
                 logits_cache_col=col[:, step],
                 use_fp64=self.use_fp64_gumbel,
             )
-            # Recover which candidate slot was drawn so the next row conditions
-            # on it. Candidate ids within a slot are distinct, so this is exact.
+            # Which candidate was drawn; top-k ids are distinct, so this is exact.
             slot = (candidate_ids[:, step] == token[:, None]).to(torch.int64).argmax(
                 dim=-1
             )
