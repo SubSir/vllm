@@ -345,15 +345,9 @@ class DFlashSpeculator(DraftModelSpeculator):
         candidate_ids: torch.Tensor,
         scores: torch.Tensor,
     ) -> torch.Tensor:
-        """Non-greedy walk, one proposal slot at a time.
-
-        Each slot's distribution is conditioned on the token drawn at the slot
-        before it, so this cannot be done in one shot. The K scores of the chosen
-        row are scattered into a target-vocabulary buffer -- everything else
-        ``-inf`` -- and handed to the same Gumbel sampler the other drafts use, so
-        ``draft_logits`` records exactly the distribution the draft sampled from
-        and the target's rejection stays lossless. This mirrors how DSpark widens
-        its reduced draft vocabulary before sampling.
+        """Non-greedy walk: each slot conditions on the token drawn at the one
+        before, so the K chosen scores are widened into a vocabulary-sized buffer
+        and sampled there, the way DSpark widens its own reduced vocabulary.
         """
         selector = self.candidate_selector
         steps = self.num_speculative_steps
