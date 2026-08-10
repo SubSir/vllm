@@ -397,7 +397,9 @@ class CandidateSelector(nn.Module):
 def dflash2_conv_spec(config):
     """(taps, group_size, block_size), or None on a DFlash checkpoint.
 
-    conv_kernel_size is the switch and must appear with conv_group_size.
+    conv_kernel_size is the switch and must appear with conv_group_size. Released
+    DFlash checkpoints spell block_size both inside dflash_config and at the top
+    level, so read it the way DFlash does: the inner one first.
     """
     dflash_config = getattr(config, "dflash_config", None) or {}
     taps = int(dflash_config.get("conv_kernel_size", 0))
@@ -409,7 +411,14 @@ def dflash2_conv_spec(config):
         )
     if not taps:
         return None
-    return taps, group_size, int(getattr(config, "block_size", 8))
+    block_size = dflash_config.get("block_size", getattr(config, "block_size", None))
+    if block_size is None:
+        raise ValueError(
+            "DFlash2 convolves within a proposal block, so the checkpoint must "
+            "declare block_size. Got neither dflash_config.block_size nor a "
+            "top-level one."
+        )
+    return taps, group_size, int(block_size)
 
 
 class DFlashQwen3DecoderLayer(nn.Module):
