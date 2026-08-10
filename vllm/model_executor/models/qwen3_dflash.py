@@ -347,10 +347,8 @@ class CandidateSelector(nn.Module):
         self.successor_codebook.weight.requires_grad_(False)
         self.hidden_projection = nn.Linear(hidden_size, state_rank, bias=False)
 
-    # Compiled here rather than by the model's @support_torch_compile: the selector
-    # runs in the speculator, past what that decorator covers. Inside the captured
-    # draft graph this is still worth 61-67% of the two steps together, because a
-    # replay pays per node.
+    # The selector runs in the speculator, past @support_torch_compile's reach.
+    # Compiling it is worth 61-67% of these two steps; a replay pays per node.
     @torch.compile(dynamic=True)
     def score_edges(
         self,
@@ -381,11 +379,7 @@ class CandidateSelector(nn.Module):
     @torch.compile(dynamic=True)
     def walk(candidate_ids: torch.Tensor, scores: torch.Tensor) -> torch.Tensor:
         """Greedy walk: slot 0 from the anchor edge, then each slot's argmax given
-        the slot chosen before it.
-
-        Sequential over the L slots, each an argmax over K=16, which compiles to a
-        cost that does not move with batch -- the per-edge maps and a log-depth scan
-        would buy nothing here.
+        the slot chosen before it. One edge at a time beats a log-depth scan here.
         """
         length = scores.shape[1]
         slot = scores[:, 0, 0].argmax(dim=-1)
@@ -399,14 +393,13 @@ class CandidateSelector(nn.Module):
         path = torch.stack(slots, dim=1)
         return candidate_ids.gather(-1, path[..., None])[..., 0]
 
+
 def dflash2_conv_spec(config, layer_idx: int):
     """(taps, group_size, block_size, sublayers) for this layer, or None.
 
-    conv_kernel_size is the switch: a DFlash checkpoint declares neither size and
-    takes the path it always took. conv_layers and conv_sites say where, absent
-    means everywhere, and a site names its sublayer -- "attention_input" and
-    "attention" are the same entry, since one module convolves a sublayer on the
-    way in and on the way out.
+    conv_kernel_size is the switch; conv_layers and conv_sites narrow where, absent
+    means everywhere. A site names its sublayer, not its direction: one module
+    convolves that sublayer both on the way in and on the way out.
     """
     dflash_config = getattr(config, "dflash_config", None) or {}
     taps = int(dflash_config.get("conv_kernel_size", 0))
